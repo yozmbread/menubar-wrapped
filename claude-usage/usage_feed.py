@@ -28,6 +28,7 @@ LIVE_EVERY = 60  # s between live usage fetches; the endpoint rate-limits (429) 
 MAX_BACKOFF = 900  # s; longest wait after failures
 DATA_EVERY = 5  # s between re-reading transcripts
 DAYS = 7
+BUSY_LINGER = 3  # s the mascot keeps walking after a turn ends
 BUSY_WINDOW = 300  # s; a turn with no transcript write for this long counts as stopped
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
@@ -324,7 +325,7 @@ def last_write():
 
 
 def stream():
-    """State every second; data on every transcript write, else every DATA_EVERY s; a JSON line on change."""
+    """State every half second; data on every transcript write, else every DATA_EVERY s; a JSON line on change."""
     latest = {"data": data()}
 
     def refresh():
@@ -337,14 +338,20 @@ def stream():
                 latest["data"] = data()
 
     threading.Thread(target=refresh, daemon=True).start()
-    last = None
+    last, busy_until = None, 0.0
     while True:
-        line = json.dumps({"state": state(), **latest["data"]})
+        st = state()
+        # Short replies (a few seconds) would barely flash; keep walking BUSY_LINGER s after the last busy check
+        if st == "busy":
+            busy_until = time.time() + BUSY_LINGER
+        elif st == "on" and time.time() < busy_until:
+            st = "busy"
+        line = json.dumps({"state": st, **latest["data"]})
         if line != last:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
             last = line
-        time.sleep(1)
+        time.sleep(0.5)
 
 
 def selfcheck():
@@ -364,8 +371,8 @@ def selfcheck():
     assert until(dt.datetime(2026, 10, 22, 0, 30), now) == "4h 50m"
     assert until(dt.datetime(2026, 10, 23, 22, 0), now) == "2d 2h"
     assert until(dt.datetime(2026, 10, 21, 19, 52), now) == "12m"
-    usage = ("Current session: 8% used · resets Oct 22 at 1:59pm (Europe/Amsterdam)\n"
-             "Current week (all models): 2.5% used · resets Oct 29 at 7am (Europe/Amsterdam)\n")
+    usage = ("Current session: 8% used · resets Oct 22 at 1:59pm (UTC)\n"
+             "Current week (all models): 2.5% used · resets Oct 29 at 7am (UTC)\n")
     lim = parse_usage(usage, dt.datetime(2026, 10, 22, 9, 0))
     assert lim["five_hour"] == {"used_percentage": 8.0, "resets_at": dt.datetime(2026, 10, 22, 13, 59).timestamp()}
     assert lim["seven_day"]["resets_at"] == dt.datetime(2026, 10, 29, 7, 0).timestamp()

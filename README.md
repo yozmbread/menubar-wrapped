@@ -21,6 +21,11 @@ cd claude-usage && ./build.sh install
 starts with your Mac; plain `./build.sh` only builds `build/Claude Usage.app`. It builds
 with the Command Line Tools' `swiftc`; Xcode isn't needed.
 
+The mascot walks whenever Claude Code is working anywhere on your Mac: the terminal, the
+VS Code or JetBrains extension, or the Claude app's Code tab (they all write transcripts to
+`~/.claude/projects`). Plain chats in the Claude app, claude.ai, the Chrome extension or other
+apps that call Claude keep nothing on your Mac, so the mascot can't see them.
+
 **It uses your own Claude account. No keys or logins are stored in this repo or the app.**
 Limits come from running Claude Code's own `claude -p /usage` once a minute (no model call,
 no saved session), so Claude Code signs in with *your* login and renews it itself. Token
