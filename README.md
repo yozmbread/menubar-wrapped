@@ -53,7 +53,7 @@ The Wrapped page only contains counts, never your event titles.
 ```bash
 brew install --cask swiftbar
 brew install ical-buddy   # optional, for the calendar section
-git clone https://github.com/<you>/menubar-wrapped.git
+git clone https://github.com/yozmbread/menubar-wrapped.git
 ```
 
 Point SwiftBar's plugin folder at the cloned folder (or symlink `wrapped.5m.py` into it).
