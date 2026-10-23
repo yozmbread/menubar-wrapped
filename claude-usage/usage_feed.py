@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 STATUS_FILE = os.path.expanduser("~/.cache/claude-usage/status.json")  # written by statusline.sh
@@ -24,6 +25,7 @@ STATUS_FILE = os.path.expanduser("~/.cache/claude-usage/status.json")  # written
 CLAUDE_DIRS = ["~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
                "~/.bun/bin"]
 LIVE_CACHE = os.path.expanduser("~/.cache/claude-usage/live.json")  # last good live numbers
+LOG = os.path.expanduser("~/.cache/claude-usage/feed.log")  # errors from the background refresh
 LIVE_EVERY = 60  # s between live usage fetches; the endpoint rate-limits (429) if polled hard
 MAX_BACKOFF = 900  # s; longest wait after failures
 DATA_EVERY = 5  # s between re-reading transcripts
@@ -41,14 +43,26 @@ def model_name(model_id):
     return f"{m[1].title()} {m[2]}" + (f".{m[3]}" if m[3] else "")
 
 
+def transcripts():
+    """(path, stat) of every transcript. Claude Code deletes and rewrites these while we scan,
+    so a file that vanishes mid-walk is skipped instead of crashing the scan."""
+    for base, _, files in os.walk(PROJECTS):
+        for f in files:
+            if f.endswith(".jsonl"):
+                path = os.path.join(base, f)
+                try:
+                    yield path, os.stat(path)
+                except OSError:
+                    continue
+
+
 def read_records(since):
     """One record per API response (transcripts repeat a response once per content block)."""
     seen = {}
-    for base, _, files in os.walk(PROJECTS):
-        for f in files:
-            path = os.path.join(base, f)
-            if not f.endswith(".jsonl") or os.path.getmtime(path) < since.timestamp():
-                continue
+    for path, st in transcripts():
+        if st.st_mtime < since.timestamp():
+            continue
+        try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     if '"usage"' not in line:
@@ -56,6 +70,8 @@ def read_records(since):
                     rec = parse(line)
                     if rec and rec["time"] >= since:
                         seen[rec["id"]] = rec
+        except OSError:
+            continue
     return sorted(seen.values(), key=lambda r: r["time"])
 
 
@@ -296,14 +312,17 @@ def turn_open(lines, now):
 def busy():
     """Any transcript whose latest turn is still open."""
     now = time.time()
-    for base, _, files in os.walk(PROJECTS):
-        for f in files:
-            path = os.path.join(base, f)
-            if f.endswith(".jsonl") and os.path.getmtime(path) > now - BUSY_WINDOW:
-                with open(path, "rb") as fh:
-                    fh.seek(max(0, os.path.getsize(path) - 200_000))
-                    if turn_open(fh.read().decode("utf-8", "replace").splitlines()[1:], now):
-                        return True
+    for path, st in transcripts():
+        if st.st_mtime <= now - BUSY_WINDOW:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(max(0, st.st_size - 200_000))
+                tail = fh.read().decode("utf-8", "replace").splitlines()[1:]
+        except OSError:
+            continue
+        if turn_open(tail, now):
+            return True
     return False
 
 
@@ -316,12 +335,18 @@ def state():
 
 def last_write():
     """Newest transcript mtime; moves on every reply Claude writes."""
-    newest = 0
-    for base, _, files in os.walk(PROJECTS):
-        for f in files:
-            if f.endswith(".jsonl"):
-                newest = max(newest, os.stat(os.path.join(base, f)).st_mtime_ns)
-    return newest
+    return max((st.st_mtime_ns for _, st in transcripts()), default=0)
+
+
+def log_error():
+    """Append the current traceback to LOG, keeping the file small."""
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 100_000:
+            os.remove(LOG)
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"--- {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{traceback.format_exc()}")
+    except OSError:
+        pass
 
 
 def stream():
@@ -332,10 +357,14 @@ def stream():
         seen, stamp = last_write(), time.time()
         while True:
             time.sleep(1)
-            now = last_write()
-            if now != seen or time.time() - stamp >= DATA_EVERY:
-                seen, stamp = now, time.time()
-                latest["data"] = data()
+            # A crash here used to kill this thread silently and freeze the menu for good
+            try:
+                now = last_write()
+                if now != seen or time.time() - stamp >= DATA_EVERY:
+                    seen, stamp = now, time.time()
+                    latest["data"] = data()
+            except Exception:
+                log_error()
 
     threading.Thread(target=refresh, daemon=True).start()
     last, busy_until = None, 0.0
@@ -396,6 +425,20 @@ def selfcheck():
     assert not turn_open([rec("user", content=[{"type": "text", "text": "[Request interrupted by user]"}])], t0)
     assert not turn_open([rec("user", content="<local-command-stdout>Set model</local-command-stdout>")], t0)
     assert not turn_open([], t0)
+    import tempfile
+    global PROJECTS
+    saved, PROJECTS = PROJECTS, tempfile.mkdtemp()
+    try:
+        for name in ("a.jsonl", "b.jsonl"):
+            open(os.path.join(PROJECTS, name), "w").close()
+        walk = transcripts()
+        next(walk)
+        for name in ("a.jsonl", "b.jsonl"):  # Claude Code removes files while we scan
+            if os.path.exists(os.path.join(PROJECTS, name)):
+                os.remove(os.path.join(PROJECTS, name))
+        assert list(walk) == [] and last_write() == 0 and read_records(dt.datetime(2026, 1, 1)) == []
+    finally:
+        PROJECTS = saved
     print("selfcheck ok")
 
 
