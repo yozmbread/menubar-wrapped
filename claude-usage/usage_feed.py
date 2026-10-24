@@ -25,6 +25,9 @@ STATUS_FILE = os.path.expanduser("~/.cache/claude-usage/status.json")  # written
 CLAUDE_DIRS = ["~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
                "~/.bun/bin"]
 LIVE_CACHE = os.path.expanduser("~/.cache/claude-usage/live.json")  # last good live numbers
+# The Claude desktop app logs the plan usage it shows (session/weekly %, no reset times) from its
+# own login, so it keeps working while Claude Code is signed out
+APP_SAMPLES = os.path.expanduser("~/Library/Application Support/Claude/plan-usage-history.json")
 LOG = os.path.expanduser("~/.cache/claude-usage/feed.log")  # errors from the background refresh
 LIVE_EVERY = 60  # s between live usage fetches; the endpoint rate-limits (429) if polled hard
 MAX_BACKOFF = 900  # s; longest wait after failures
@@ -33,6 +36,16 @@ DAYS = 7
 BUSY_LINGER = 3  # s the mascot keeps walking after a turn ends
 BUSY_WINDOW = 300  # s; a turn with no transcript write for this long counts as stopped
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+WINDOWS = (("five_hour", "fh", "Session", 5 * 3600), ("seven_day", "sd", "Weekly", 7 * 86400))
+# $ per million tokens: input, output, cache read (Anthropic API list prices, 2026-10-06).
+# Cache writes bill 1.25x input for the 5-minute TTL and 2x for 1 hour. On Pro/Max this is what the
+# same work would cost on the API, not your bill.
+PRICES = {
+    "Fable 5.1": (10, 50, 0.25), "Fable 5": (10, 50, 1.00),
+    "Opus 5.5": (4, 20, 0.20), "Opus 5": (5, 25, 0.50), "Opus 4.8": (5, 25, 0.50), "Opus 4.7": (5, 25, 0.50),
+    "Opus 4.6": (5, 25, 0.50), "Sonnet 5.5": (2, 10, 0.20), "Sonnet 5": (2, 10, 0.20), "Sonnet 4.6": (3, 15, 0.30),
+    "Haiku 5.5": (0.10, 0.50, 0.01), "Haiku 4.5": (1, 5, 0.10),
+}
 
 
 def model_name(model_id):
@@ -56,22 +69,37 @@ def transcripts():
                     continue
 
 
+_parsed = {}  # path -> (bytes read so far, {response id: record})
+
+
 def read_records(since):
-    """One record per API response (transcripts repeat a response once per content block)."""
+    """One record per API response (transcripts repeat a response once per content block).
+    Transcripts only grow, so each call reads just the bytes added since the last one; while
+    Claude works this runs every second, and re-reading days of transcripts cost ~15% CPU."""
     seen = {}
     for path, st in transcripts():
         if st.st_mtime < since.timestamp():
             continue
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"usage"' not in line:
-                        continue
+        offset, recs = _parsed.get(path, (0, {}))
+        if st.st_size < offset:  # rewritten from scratch
+            offset, recs = 0, {}
+        if st.st_size > offset:
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+            except OSError:
+                continue
+            end = chunk.rfind(b"\n") + 1  # a half-written last line waits for the next call
+            for line in chunk[:end].decode("utf-8", "replace").splitlines():
+                if '"usage"' in line:
                     rec = parse(line)
-                    if rec and rec["time"] >= since:
-                        seen[rec["id"]] = rec
-        except OSError:
-            continue
+                    if rec:
+                        recs[rec["id"]] = rec
+            _parsed[path] = (offset + end, recs)
+        for rid, rec in recs.items():
+            if rec["time"] >= since:
+                seen[rid] = rec
     return sorted(seen.values(), key=lambda r: r["time"])
 
 
@@ -94,12 +122,29 @@ def parse(line):
         "effort": d.get("effort"),
         "fast": u.get("speed") == "fast",
         "sub": d.get("isSidechain", False),
+        "write_1h": (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0,
         **{k: u.get(k) or 0 for k in TOKEN_KEYS},
     }
 
 
+def cost(r):
+    """(dollars, priced): the record at API list prices; unknown models are priced as Opus 5.5."""
+    name = model_name(r["model"])
+    inp, out, read = PRICES.get(name, PRICES["Opus 5.5"])
+    write_1h = min(r.get("write_1h", 0), r["cache_creation_input_tokens"])
+    usd = (r["input_tokens"] * inp + r["output_tokens"] * out + r["cache_read_input_tokens"] * read
+           + (r["cache_creation_input_tokens"] - write_1h) * inp * 1.25 + write_1h * inp * 2) / 1e6
+    return usd * (2 if r["fast"] else 1), name in PRICES  # ponytail: fast mode as a flat 2x
+
+
 def total(recs):
     return sum(r[k] for r in recs for k in TOKEN_KEYS)
+
+
+def dollars(recs):
+    """"$4.20", or "~$4.20" when some model had no known price."""
+    priced = [cost(r) for r in recs]
+    return ("" if all(ok for _, ok in priced) else "~") + f"${sum(c for c, _ in priced):.2f}"
 
 
 def fmt(n):
@@ -122,7 +167,7 @@ _live = {"next": 0.0, "backoff": LIVE_EVERY, "problem": None}
 PROBLEMS = {
     "no-claude": "Install Claude Code to see plan limits",
     "no-plan": "Plan limits need Claude Code signed in to a Pro or Max plan",
-    None: "Loading plan limits…",
+    "signed-out": "Claude Code is signed out · run: claude auth login",
 }
 
 
@@ -143,33 +188,83 @@ def live_limits():
     except (OSError, subprocess.SubprocessError):
         return None, None, None
     limits = parse_usage(out, dt.datetime.now())
-    # No limit lines: signed out, or signed in with an API key (pay-as-you-go has no plan limits)
-    return limits, None, None if limits else "no-plan"
+    if limits:
+        return limits, None, None
+    # No limit lines: signed out (then /usage prints a cost summary instead), or an API-key login
+    return None, None, "signed-out" if signed_out(claude) else "no-plan"
 
 
-USAGE_LINES = {"five_hour": r"Current session: ([\d.]+)% used · resets (.+?) \(",
-               "seven_day": r"Current week \(all models\): ([\d.]+)% used · resets (.+?) \("}
+def signed_out(claude):
+    try:
+        out = subprocess.run([claude, "auth", "status"], capture_output=True, text=True, timeout=30).stdout
+        return json.loads(out).get("loggedIn") is False
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return False
+
+
+# The reset part is missing while no session window is open yet
+USAGE_LINES = {"five_hour": r"Current session: ([\d.]+)% used(?: · resets (.+?) \()?",
+               "seven_day": r"Current week \(all models\): ([\d.]+)% used(?: · resets (.+?) \()?"}
 
 
 def parse_usage(text, now):
-    """/usage text -> {five_hour: {used_percentage, resets_at}}; reset times are local, year implied."""
+    """/usage text -> {five_hour: {used_percentage, resets_at}}; reset times are local, year implied.
+    resets_at is None when /usage gives none (no session window yet)."""
     out = {}
     for key, pattern in USAGE_LINES.items():
         m = re.search(pattern, text)
         if not m:
             continue
+        reset = None
         for form in ("%b %d at %I:%M%p %Y", "%b %d at %I%p %Y"):  # "1:59pm" or "2pm"
             try:
                 reset = dt.datetime.strptime(f"{m[2]} {now.year}", form)
                 break
-            except ValueError:
-                reset = None
-        if reset is None:
-            continue
-        if reset < now - dt.timedelta(days=1):  # e.g. a January reset seen in December
+            except (TypeError, ValueError):
+                continue
+        if reset and reset < now - dt.timedelta(days=1):  # e.g. a January reset seen in December
             reset = reset.replace(year=now.year + 1)
-        out[key] = {"used_percentage": float(m[1]), "resets_at": reset.timestamp()}
+        out[key] = {"used_percentage": float(m[1]), "resets_at": reset.timestamp() if reset else None}
     return out or None
+
+
+def app_samples():
+    """(time, limits) from the Claude desktop app's newest usage sample, or (0, None)."""
+    try:
+        with open(APP_SAMPLES, encoding="utf-8") as fh:
+            samples = [x for x in json.load(fh).get("samples", []) if isinstance(x, dict) and isinstance(x.get("u"), dict)]
+    except (OSError, ValueError, AttributeError):
+        return 0, None
+    if not samples:
+        return 0, None
+    newest = max(samples, key=lambda x: x.get("t", 0))
+    limits = {key: {"used_percentage": float(newest["u"][short]), "resets_at": None}
+              for key, short, _, _ in WINDOWS if isinstance(newest["u"].get(short), (int, float))}
+    return newest.get("t", 0) / 1000, limits or None
+
+
+def merge(sources, now):
+    """Per window: the newest reading's %, and the reset time from the newest source that has one.
+    sources = [(name, fetched_at, limits)]. A reading from before its window reset counts as 0%."""
+    out = {}
+    for key, _, _, length in WINDOWS:
+        readings = [(t, name, lim[key]) for name, t, lim in sources if lim and lim.get(key)]
+        if not readings:
+            continue
+        t, name, w = max(readings, key=lambda x: x[0])
+        used = w["used_percentage"]
+        resets = [(rt, r["resets_at"]) for rt, _, r in readings if r.get("resets_at")]
+        reset = max(resets)[1] if resets else None
+        if reset is not None and reset <= now:
+            if t < reset:  # the newest reading is from the window that has since reset
+                used = 0
+            if key == "seven_day":  # weekly resets repeat at the same time each week
+                while reset <= now:
+                    reset += length
+            else:  # a new session window starts with the next message; its reset isn't known yet
+                reset = None
+        out[key] = {"used_percentage": used, "resets_at": reset, "fetched": t, "source": name}
+    return out
 
 
 def load_cache():
@@ -198,8 +293,8 @@ def iso_ts(text):
 
 
 def read_limits():
-    """(limits, source, fetched_at). Live numbers are cached on disk so restarts don't refetch;
-    after a failure we back off. Falls back to what statusline.sh saved."""
+    """Merged limits from Claude Code's /usage (every LIVE_EVERY s, cached on disk, backoff after
+    failures), the Claude app's own samples, and what statusline.sh saved; the newest reading wins."""
     now = time.time()
     cache = load_cache()
     if now >= _live["next"] and now - cache["t"] >= LIVE_EVERY:
@@ -211,28 +306,31 @@ def read_limits():
         else:
             _live["backoff"] = next_backoff(_live["backoff"], retry_after)
         _live["next"] = now + _live["backoff"]
-    if cache["limits"] and now - cache["t"] < 6 * 3600:
-        return cache["limits"], "live", cache["t"]
+    sources = [("Claude Code", cache["t"], cache["limits"]), ("Claude app", *app_samples())]
     try:
         with open(STATUS_FILE, encoding="utf-8") as fh:
-            saved = json.load(fh).get("rate_limits")
-        return (saved, "saved", os.path.getmtime(STATUS_FILE)) if saved else (None, "none", 0)
-    except (OSError, ValueError):
-        return None, "none", 0
+            sources.append(("status line", os.path.getmtime(STATUS_FILE), json.load(fh).get("rate_limits")))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return merge(sources, now)
 
 
 def limit_rows(limits, now):
     rows = []
-    for key, label, length in (("five_hour", "Session", 5 * 3600), ("seven_day", "Weekly", 7 * 86400)):
+    for key, _, label, length in WINDOWS:
         w = (limits or {}).get(key)
         if not w:
             continue
-        reset = dt.datetime.fromtimestamp(w["resets_at"])
-        if reset > now:
-            rows.append({"label": label, "used": w["used_percentage"], "resets": f"resets in {until(reset, now)}",
-                         "timeLeft": (reset - now).total_seconds() / length})
-        else:  # window rolled over since the numbers were saved
-            rows.append({"label": label, "used": 0, "resets": "new window", "timeLeft": 1.0})
+        row = {"label": label, "used": w["used_percentage"], "resetsAt": w["resets_at"],
+               "fetched": w.get("fetched", 0), "source": w.get("source", "")}
+        if w["resets_at"] and w["resets_at"] > now.timestamp():
+            reset = dt.datetime.fromtimestamp(w["resets_at"])
+            row.update(resets=f"resets in {until(reset, now)}", timeLeft=(reset - now).total_seconds() / length)
+        elif w["used_percentage"] == 0:
+            row.update(resets="new window", timeLeft=1.0)
+        else:
+            row.update(resets="reset time unknown", timeLeft=1.0)
+        rows.append(row)
     return rows
 
 
@@ -242,34 +340,35 @@ def data():
     today = [r for r in recs if r["time"].date() == now.date()]
     main = [r for r in recs if not r["sub"]]
     last = main[-1] if main else (recs[-1] if recs else None)
-    limits, source, fetched = read_limits()
-    by_model = collections.Counter()
+    rows = limit_rows(read_limits(), now)
+    by_model = collections.defaultdict(list)
     for r in today:
-        by_model[model_name(r["model"])] += total([r])
-    per_day = collections.Counter()
+        by_model[model_name(r["model"])].append(r)
+    per_day = collections.defaultdict(list)
     for r in recs:
-        per_day[r["time"].date()] += total([r])
-    top = max(per_day.values(), default=1)
+        per_day[r["time"].date()].append(r)
+    day_cost = {day: sum(cost(r)[0] for r in rs) for day, rs in per_day.items()}
+    top = max(day_cost.values(), default=0) or 1
     week = []
     for i in range(DAYS - 1, -1, -1):
         day = now.date() - dt.timedelta(days=i)
-        n = per_day.get(day, 0)
-        week.append(f"{day:%a %d}  {'█' * round(10 * n / top) if n else '·'} {fmt(n)}")
+        usd = day_cost.get(day, 0)
+        week.append(f"{day:%a %d}  {'█' * round(10 * usd / top) if usd else '·'} ${usd:.2f}")
     return {
-        "limits": limit_rows(limits, now),
-        "limitsSource": source,
-        "limitsFetched": fetched,  # epoch; the app shows how old the numbers are
-        "limitsNote": PROBLEMS[_live["problem"]],
-        "today": f"{fmt(total(today))} tokens",        "todayDetail": [
+        "limits": rows,
+        "limitsNote": PROBLEMS.get(_live["problem"]) or (None if rows else "Loading plan limits…"),
+        "today": f"{dollars(today)} (Claude Code)",
+        "todayDetail": [
+            f"Tokens: {fmt(total(today))}",
             f"Output: {fmt(sum(r['output_tokens'] for r in today))}",
             f"Fresh input: {fmt(sum(r['input_tokens'] + r['cache_creation_input_tokens'] for r in today))}",
             f"Cache reads: {fmt(sum(r['cache_read_input_tokens'] for r in today))}",
             f"Replies: {len(today)}",
-        ] + [f"{m}: {fmt(n)}" for m, n in by_model.most_common()],
+        ] + [f"{m}: {dollars(rs)}" for m, rs in sorted(by_model.items(), key=lambda x: -sum(cost(r)[0] for r in x[1]))],
         "model": (model_name(last["model"]) + (" (fast)" if last["fast"] else "")) if last else None,
         "effort": (last["effort"] or "default") if last else None,
         "context": f"{fmt(sum(last[k] for k in TOKEN_KEYS if k != 'output_tokens'))} tokens" if last else None,
-        "weekTotal": f"{fmt(total(recs))} tokens",
+        "weekTotal": dollars(recs),
         "week": week,
     }
 
@@ -384,6 +483,7 @@ def stream():
 
 
 def selfcheck():
+    import tempfile
     assert model_name("claude-opus-5-5") == "Opus 5.5"
     assert model_name("claude-haiku-4-5-20251001") == "Haiku 4.5"
     assert model_name("claude-sonnet-4-20250514") == "Sonnet 4"
@@ -411,9 +511,53 @@ def selfcheck():
     assert next_backoff(60, 300) == 300
     assert iso_ts("2026-11-05T07:59:00Z") == iso_ts("2026-11-05T07:59:00.123456+00:00")
     reset = dt.datetime(2026, 10, 21, 22, 10)
-    rows = limit_rows({"five_hour": {"used_percentage": 8, "resets_at": reset.timestamp()}}, now)
-    assert rows == [{"label": "Session", "used": 8, "resets": "resets in 2h 30m", "timeLeft": 0.5}]
-    assert limit_rows({"five_hour": {"used_percentage": 8, "resets_at": 0}}, now)[0]["resets"] == "new window"
+    rows = limit_rows({"five_hour": {"used_percentage": 8, "resets_at": reset.timestamp(), "fetched": 5,
+                                     "source": "Claude Code"}}, now)
+    assert rows == [{"label": "Session", "used": 8, "resetsAt": reset.timestamp(), "fetched": 5,
+                     "source": "Claude Code", "resets": "resets in 2h 30m", "timeLeft": 0.5}]
+    assert limit_rows({"five_hour": {"used_percentage": 0, "resets_at": None}}, now)[0]["resets"] == "new window"
+    assert limit_rows({"five_hour": {"used_percentage": 3, "resets_at": None}}, now)[0]["resets"] == "reset time unknown"
+
+    # Signed out, /usage prints a cost summary: no limits
+    assert parse_usage("Total cost:            $0.0000\nUsage: 0 input, 0 output", now) is None
+    # No session window yet: % without a reset time; the weekly line still parses
+    idle = parse_usage("Current session: 0% used\nCurrent week (all models): 11% used · resets Oct 29 at 6:59am (UTC)",
+                       dt.datetime(2026, 10, 24, 22, 0))
+    assert idle["five_hour"] == {"used_percentage": 0.0, "resets_at": None}
+    assert idle["seven_day"]["used_percentage"] == 11.0
+
+    # merge: newest % wins, reset time comes from whichever source has one
+    T = dt.datetime(2026, 10, 24, 22, 0).timestamp()
+    wk = dt.datetime(2026, 10, 29, 6, 59).timestamp()
+    old_cli = {"five_hour": {"used_percentage": 20, "resets_at": T - 3600}, "seven_day": {"used_percentage": 5, "resets_at": wk}}
+    app = {"five_hour": {"used_percentage": 0, "resets_at": None}, "seven_day": {"used_percentage": 11, "resets_at": None}}
+    m = merge([("Claude Code", T - 2 * 86400, old_cli), ("Claude app", T - 60, app)], T)
+    assert m["seven_day"] == {"used_percentage": 11, "resets_at": wk, "fetched": T - 60, "source": "Claude app"}
+    assert m["five_hour"]["used_percentage"] == 0 and m["five_hour"]["resets_at"] is None  # old session reset passed
+    # a stale reading from before its window reset counts as 0%, and the weekly reset rolls forward
+    m = merge([("Claude Code", wk - 600, {"seven_day": {"used_percentage": 40, "resets_at": wk}})], wk + 60)
+    assert m["seven_day"]["used_percentage"] == 0 and m["seven_day"]["resets_at"] == wk + 7 * 86400
+    assert merge([("Claude Code", 0, None)], T) == {}
+
+    # app samples file: newest sample, ints as %
+    global APP_SAMPLES
+    saved_app, APP_SAMPLES = APP_SAMPLES, tempfile.mktemp()
+    try:
+        with open(APP_SAMPLES, "w") as fh:
+            json.dump({"version": 2, "samples": [{"t": 2000, "u": {"fh": 9, "sd": 11}}, {"t": 1000, "u": {"fh": 1, "sd": 2}}]}, fh)
+        assert app_samples() == (2.0, {"five_hour": {"used_percentage": 9.0, "resets_at": None},
+                                       "seven_day": {"used_percentage": 11.0, "resets_at": None}})
+        os.remove(APP_SAMPLES)
+        assert app_samples() == (0, None)
+    finally:
+        APP_SAMPLES = saved_app
+
+    # cost at list prices: Opus 5.5, 1M each of input/output/cache read/5-min write/1-hour write
+    big = {"model": "claude-opus-5-5", "fast": False, "input_tokens": 10**6, "output_tokens": 10**6,
+           "cache_read_input_tokens": 10**6, "cache_creation_input_tokens": 2 * 10**6, "write_1h": 10**6}
+    assert abs(cost(big)[0] - (4 + 20 + 0.20 + 5 + 8)) < 1e-9 and cost(big)[1]
+    assert dollars([big]) == "$37.20" and dollars([dict(big, model="claude-new-9")]) == "~$37.20"
+    assert dollars([]) == "$0.00"
     t0 = iso_ts("2026-10-21T20:00:00Z")
 
     def rec(kind, stop=None, content=None, ts="2026-10-21T20:00:00Z"):
@@ -425,7 +569,6 @@ def selfcheck():
     assert not turn_open([rec("user", content=[{"type": "text", "text": "[Request interrupted by user]"}])], t0)
     assert not turn_open([rec("user", content="<local-command-stdout>Set model</local-command-stdout>")], t0)
     assert not turn_open([], t0)
-    import tempfile
     global PROJECTS
     saved, PROJECTS = PROJECTS, tempfile.mkdtemp()
     try:
@@ -437,6 +580,14 @@ def selfcheck():
             if os.path.exists(os.path.join(PROJECTS, name)):
                 os.remove(os.path.join(PROJECTS, name))
         assert list(walk) == [] and last_write() == 0 and read_records(dt.datetime(2026, 1, 1)) == []
+        # incremental reads: a half-written line is picked up once it's complete, nothing twice
+        path = os.path.join(PROJECTS, "c.jsonl")
+        with open(path, "w") as fh:
+            fh.write(line + "\n" + line.replace('"m1"', '"m2"')[:40])
+        assert [r["id"] for r in read_records(dt.datetime(2026, 1, 1))] == ["m1"]
+        with open(path, "w") as fh:
+            fh.write(line + "\n" + line.replace('"m1"', '"m2"') + "\n" + line + "\n")
+        assert sorted(r["id"] for r in read_records(dt.datetime(2026, 1, 1))) == ["m1", "m2"]
     finally:
         PROJECTS = saved
     print("selfcheck ok")

@@ -3,20 +3,22 @@
 // and walking in place while Claude works.
 // Data comes from usage_feed.py (bundled in Resources), which prints a JSON line on every change.
 import AppKit
+import UserNotifications
 
 struct Limit: Decodable {
     let label: String
     let used: Double
     let resets: String
     let timeLeft: Double
+    var resetsAt: Double? = nil  // epoch; nil when the reset time isn't known
+    var fetched: Double = 0  // epoch the % was read
+    var source = ""  // Claude Code | Claude app | status line
 }
 
 struct Snapshot: Decodable {
     let state: String  // off | on | busy
     let limits: [Limit]
-    let limitsSource: String  // live | saved | none
-    let limitsFetched: Double  // epoch seconds the numbers are from
-    let limitsNote: String  // why there are no limits to show, when there are none
+    let limitsNote: String?  // a problem worth showing, e.g. Claude Code signed out
     let today: String
     let todayDetail: [String]
     let model: String?
@@ -59,6 +61,8 @@ let mascotWalk = [
      "..#....#...."],
 ]
 let claudeOrange = NSColor(srgbRed: 217 / 255, green: 119 / 255, blue: 87 / 255, alpha: 1)
+let usagePage = URL(string: "https://claude.ai/settings/usage")!
+let alertLevels: [Double] = [80, 95]
 
 /// One mascot frame, 2 pt per cell (24x16 pt), drawn as crisp squares.
 func mascotImage(_ rows: [String], color: NSColor) -> NSImage {
@@ -150,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         startFeed()
     }
 
@@ -183,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func apply(_ snap: Snapshot) {
         snapshot = snap
+        checkAlerts(snap.limits)
         // Live-refresh an open menu, unless a submenu is showing (rebuilding would close it)
         if menuOpen, let menu = item.menu, menu.highlightedItem?.submenu == nil { menuNeedsUpdate(menu) }
         if snap.state == "busy" {
@@ -219,17 +225,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.view = LimitView(limit)
             menu.addItem(row)
         }
-        if s.limits.isEmpty {
-            menu.addItem(header(s.limitsNote))
-        } else {
-            let minutes = Int(Date().timeIntervalSince1970 - s.limitsFetched) / 60
-            let age = minutes < 60 ? "\(minutes) min" : "\(minutes / 60) h \(minutes % 60) min"
-            if s.limitsSource != "live" {
-                menu.addItem(header("Live usage unavailable · numbers from \(age) ago"))
-            } else if minutes >= 3 {
-                menu.addItem(header("Updated \(age) ago"))
-            }
+        if let newest = s.limits.max(by: { $0.fetched < $1.fetched }) {
+            let minutes = Int(Date().timeIntervalSince1970 - newest.fetched) / 60
+            let age = minutes < 1 ? "just now" : minutes < 60 ? "\(minutes) min ago" : "\(minutes / 60) h \(minutes % 60) min ago"
+            menu.addItem(header("Updated \(age) · from \(newest.source)"))
         }
+        if let note = s.limitsNote { menu.addItem(header(note)) }
         menu.addItem(.separator())
         menu.addItem(row("Today", s.today, submenu: s.todayDetail))
         if let model = s.model { menu.addItem(row("Model", model)) }
@@ -242,6 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func addFooter(_ menu: NSMenu) {
         menu.addItem(.separator())
+        menu.addItem(withTitle: "Open usage page", action: #selector(openUsage), keyEquivalent: "u").target = self
         menu.addItem(withTitle: "Refresh", action: #selector(refresh), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Quit Claude Usage", action: #selector(quit), keyEquivalent: "q").target = self
     }
@@ -276,6 +278,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func refresh() { feed?.terminate() }  // the termination handler restarts it with fresh data
 
+    @objc func openUsage() { NSWorkspace.shared.open(usagePage) }
+
+    /// One notification per level (80%, 95%) per limit window. A window is its reset time, or a
+    /// 5-hour bucket while the reset time is unknown.
+    func checkAlerts(_ limits: [Limit]) {
+        var fired = UserDefaults.standard.stringArray(forKey: "firedAlerts") ?? []
+        for limit in limits {
+            let window = limit.resetsAt.map { String(Int($0)) } ?? "t\(Int(limit.fetched) / 18000)"
+            for level in alertLevels where limit.used >= level {
+                let key = "\(limit.label)-\(Int(level))-\(window)"
+                guard !fired.contains(key) else { continue }
+                fired.append(key)
+                notify("Claude \(limit.label.lowercased()) limit \(Int(limit.used.rounded()))% used", limit.resets)
+            }
+        }
+        UserDefaults.standard.set(Array(fired.suffix(40)), forKey: "firedAlerts")
+    }
+
+    func notify(_ title: String, _ body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            guard error != nil else { return }
+            // Notifications not allowed for this ad-hoc signed app: let AppleScript post it instead
+            let script = "display notification \(Self.quoted(body)) with title \(Self.quoted(title))"
+            _ = try? Process.run(URL(fileURLWithPath: "/usr/bin/osascript"), arguments: ["-e", script])
+        }
+    }
+
+    static func quoted(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
     @objc func quit() {
         quitting = true
         feed?.terminate()
@@ -298,6 +336,11 @@ func renderPreview(to path: String) {
     }
     let session = LimitView(Limit(label: "Session", used: 22, resets: "resets in 4h 11m", timeLeft: 0.84))
     let weekly = LimitView(Limit(label: "Weekly", used: 93, resets: "resets in 9h 41m", timeLeft: 0.06))
+    if CommandLine.arguments.contains("--test-alert") {  // posts one sample notification
+        let d = AppDelegate()
+        d.notify("Claude session limit 80% used", "resets in 1h 20m")
+        RunLoop.main.run(until: Date().addingTimeInterval(3))
+    }
     session.frame.origin = NSPoint(x: 0, y: 52)
     weekly.frame.origin = NSPoint(x: 0, y: 6)
     canvas.addSubview(session)

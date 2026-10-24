@@ -4,14 +4,18 @@ Two small macOS menu bar tools built from your own data.
 
 ## Claude Usage (native app)
 
-A Claude logo in the menu bar: grey when the Claude app is closed, white when it's open,
-spinning while Claude is working. Click it for:
+Claude Code's pixel mascot in the menu bar: grey when Claude is closed, orange when it's
+open, walking while Claude works. Click it for:
 
 - **Plan usage limits**: session and weekly %, time until reset, a progress bar and an
-  hourglass, the same numbers as Claude's own usage panel (refreshed every 30 s)
-- **Today**: tokens used today, with output / input / cache / per-model detail
+  hourglass, the same numbers as Claude's own usage panel, with where and when they were read
+- **Today**: what today's Claude Code work would cost at API list prices, with tokens,
+  replies and per-model detail
 - **Model, Effort, Context** of your latest Claude Code reply
-- **Last 7 days** per-day bars
+- **Last 7 days**: cost per day
+- **Open usage page**: Claude's own usage settings in your browser
+- A notification when a limit passes 80% and 95% (once per window; allow notifications
+  for Claude Usage in System Settings > Notifications)
 
 ```bash
 cd claude-usage && ./build.sh install
@@ -27,14 +31,23 @@ VS Code or JetBrains extension, or the Claude app's Code tab (they all write tra
 apps that call Claude keep nothing on your Mac, so the mascot can't see them.
 
 **It uses your own Claude account. No keys or logins are stored in this repo or the app.**
-Limits come from running Claude Code's own `claude -p /usage` once a minute (no model call,
-no saved session), so Claude Code signs in with *your* login and renews it itself. Token
-counts come from your Claude Code transcripts in `~/.claude/projects`, read locally.
+Plan limits come from whichever of these is newest:
+
+1. Claude Code's own `claude -p /usage`, run once a minute (no model call, no saved session).
+   Claude Code signs in with *your* login and renews it itself.
+2. The usage the Claude desktop app records in
+   `~/Library/Application Support/Claude/plan-usage-history.json` (every ~15 minutes and
+   whenever its usage panel opens). This keeps the bars right even if Claude Code is signed out.
+3. The numbers your Claude Code status line last saved, if you set that up (`usage_feed.py`).
+
+If Claude Code is signed out, the menu says so: run `claude auth login`. Token counts and
+costs come from your Claude Code transcripts in `~/.claude/projects`, read locally. The cost
+is an estimate at API list prices (including cache reads and writes); on a Pro or Max plan
+it's what the same work would cost on the API, not your bill.
 
 Requirements: macOS 13+, the Command Line Tools (`xcode-select --install`), and
 [Claude Code](https://docs.claude.com/en/docs/claude-code) signed in. Plan limits need a Pro
-or Max plan; with an API key the menu still shows tokens, model and effort. If `/usage`
-fails, the app shows the numbers your status line last saved and says how old they are.
+or Max plan; with an API key the menu still shows cost, model and effort.
 
 ## Wrapped (SwiftBar plugin)
 
