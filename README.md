@@ -33,8 +33,10 @@ apps that call Claude keep nothing on your Mac, so the mascot can't see them.
 **It uses your own Claude account. No keys or logins are stored in this repo or the app.**
 Plan limits come from whichever of these is newest:
 
-1. Claude Code's own `claude -p /usage`, run once a minute (no model call, no saved session).
-   Claude Code signs in with *your* login and renews it itself.
+1. Claude Code's own `claude -p /usage` (no model call, no saved session). Claude Code signs in
+   with *your* login and renews it itself. Usage only changes when Claude replies, so it runs
+   5 s and 30 s after a Claude turn ends, every 30 s while Claude works, every 5 minutes when
+   idle, and right away when you open the menu or press Refresh (never twice within 15 s).
 2. The usage the Claude desktop app records in
    `~/Library/Application Support/Claude/plan-usage-history.json` (every ~15 minutes and
    whenever its usage panel opens). This keeps the bars right even if Claude Code is signed out.

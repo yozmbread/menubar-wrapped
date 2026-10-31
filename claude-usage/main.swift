@@ -143,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let offIcon = mascotImage(mascotRest, color: .systemGray)
     var snapshot: Snapshot?
     var feed: Process?
+    var feedInput: FileHandle?
     var spinTimer: Timer?
     var frame = 0
     var quitting = false
@@ -165,6 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         process.arguments = [script]
         let pipe = Pipe()
         process.standardOutput = pipe
+        let input = Pipe()
+        process.standardInput = input
+        feedInput = input.fileHandleForWriting
         var buffer = Data()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             buffer.append(handle.availableData)
@@ -208,7 +212,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) { menuOpen = true }
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        send("refresh")  // fresh limits land in the open menu a few seconds later
+    }
+
+    /// Commands for the feed, one per line on its stdin
+    func send(_ command: String) {
+        try? feedInput?.write(contentsOf: Data((command + "\n").utf8))
+    }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     // Rebuilt each time the menu opens and on every new snapshot while open
@@ -276,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    @objc func refresh() { feed?.terminate() }  // the termination handler restarts it with fresh data
+    @objc func refresh() { send("refresh") }
 
     @objc func openUsage() { NSWorkspace.shared.open(usagePage) }
 
@@ -358,4 +370,5 @@ let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
+signal(SIGPIPE, SIG_IGN)  // a feed that just died must not take the app down with a write
 app.run()

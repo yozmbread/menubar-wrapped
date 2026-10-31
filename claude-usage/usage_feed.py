@@ -29,7 +29,13 @@ LIVE_CACHE = os.path.expanduser("~/.cache/claude-usage/live.json")  # last good 
 # own login, so it keeps working while Claude Code is signed out
 APP_SAMPLES = os.path.expanduser("~/Library/Application Support/Claude/plan-usage-history.json")
 LOG = os.path.expanduser("~/.cache/claude-usage/feed.log")  # errors from the background refresh
-LIVE_EVERY = 60  # s between live usage fetches; the endpoint rate-limits (429) if polled hard
+# When to run /usage: usage only moves when Claude replies, so fetch right after a turn ends,
+# often while Claude works, rarely when idle, and whenever you open the menu. The endpoint behind
+# /usage rate-limits (429) if polled hard, hence MIN_GAP and the backoff.
+FETCH_BUSY = 30  # s between fetches while Claude works
+FETCH_IDLE = 300  # s between fetches while nothing runs
+FETCH_AFTER_TURN = (5, 30)  # s after a turn ends; the second catches late accounting
+MIN_GAP = 15  # s; never two fetches closer than this
 MAX_BACKOFF = 900  # s; longest wait after failures
 DATA_EVERY = 5  # s between re-reading transcripts
 DAYS = 7
@@ -161,7 +167,7 @@ def until(reset, now):
     return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
 
 
-_live = {"next": 0.0, "backoff": LIVE_EVERY, "problem": None}
+_live = {"problem": None}
 
 # Shown instead of the limit bars when there are none to show
 PROBLEMS = {
@@ -292,20 +298,61 @@ def iso_ts(text):
     return dt.datetime.fromisoformat(re.sub(r"\.\d+", "", text).replace("Z", "+00:00")).timestamp()
 
 
+def next_fetch(last, busy, turn_end, retry_at):
+    """Epoch of the next scheduled /usage call. last = previous attempt, turn_end = when the last
+    Claude turn finished, retry_at = earliest retry after a failure."""
+    due = last + (FETCH_BUSY if busy else FETCH_IDLE)
+    for delay in FETCH_AFTER_TURN:
+        if turn_end + delay > last:
+            due = min(due, turn_end + delay)
+    return max(due, last + MIN_GAP, retry_at)
+
+
+def should_fetch(now, last, due, requested):
+    """Fetch when due, or right away on request (menu opened, Refresh) unless MIN_GAP isn't up."""
+    return now >= due or (requested and now - last >= MIN_GAP)
+
+
+def fetch_once():
+    """Run /usage now; cache good numbers. Returns (ok, retry_after)."""
+    limits, retry_after, _live["problem"] = live_limits()
+    if limits:
+        save_cache({"t": time.time(), "limits": limits})
+    return bool(limits), retry_after
+
+
+def live_loop(status, wake, on_fetch):
+    """Runs /usage on the next_fetch() schedule, or as soon as `wake` is set (a refresh request).
+    status = {"busy": bool, "turn_end": epoch}, kept current by stream()."""
+    last, retry_at, backoff = load_cache()["t"], 0.0, FETCH_BUSY  # a restart doesn't refetch fresh numbers
+    while True:
+        try:
+            due = next_fetch(last, status["busy"], status["turn_end"], retry_at)
+            requested = wake.wait(timeout=min(max(due - time.time(), 0.05), 1))  # re-check busy every second
+            wake.clear()
+            now = time.time()
+            if not should_fetch(now, last, due, requested):
+                continue
+            ok, retry_after = fetch_once()
+            last = now
+            backoff = FETCH_BUSY if ok else next_backoff(backoff, retry_after)
+            retry_at = 0.0 if ok else now + backoff
+            on_fetch()
+        except Exception:
+            log_error()
+            time.sleep(5)
+
+
+def parse_command(line):
+    """Commands the app writes to our stdin, one per line."""
+    return "refresh" if line.strip().lower() == "refresh" else None
+
+
 def read_limits():
-    """Merged limits from Claude Code's /usage (every LIVE_EVERY s, cached on disk, backoff after
-    failures), the Claude app's own samples, and what statusline.sh saved; the newest reading wins."""
+    """Merged limits from Claude Code's /usage (as cached by live_loop), the Claude app's own
+    samples, and what statusline.sh saved; the newest reading wins. No network here."""
     now = time.time()
     cache = load_cache()
-    if now >= _live["next"] and now - cache["t"] >= LIVE_EVERY:
-        limits, retry_after, _live["problem"] = live_limits()
-        if limits:
-            cache = {"t": now, "limits": limits}
-            save_cache(cache)
-            _live["backoff"] = LIVE_EVERY
-        else:
-            _live["backoff"] = next_backoff(_live["backoff"], retry_after)
-        _live["next"] = now + _live["backoff"]
     sources = [("Claude Code", cache["t"], cache["limits"]), ("Claude app", *app_samples())]
     try:
         with open(STATUS_FILE, encoding="utf-8") as fh:
@@ -449,23 +496,34 @@ def log_error():
 
 
 def stream():
-    """State every half second; data on every transcript write, else every DATA_EVERY s; a JSON line on change."""
+    """State every half second; data on every transcript write or fetch, else every DATA_EVERY s;
+    a JSON line on change. Reads `refresh` commands from stdin."""
     latest = {"data": data()}
+    status = {"busy": False, "turn_end": 0.0}
+    fetch_wake, data_wake = threading.Event(), threading.Event()
 
     def refresh():
         seen, stamp = last_write(), time.time()
         while True:
-            time.sleep(1)
+            fetched = data_wake.wait(timeout=1)
+            data_wake.clear()
             # A crash here used to kill this thread silently and freeze the menu for good
             try:
                 now = last_write()
-                if now != seen or time.time() - stamp >= DATA_EVERY:
+                if fetched or now != seen or time.time() - stamp >= DATA_EVERY:
                     seen, stamp = now, time.time()
                     latest["data"] = data()
             except Exception:
                 log_error()
 
+    def commands():
+        for line in iter(sys.stdin.readline, ""):  # ends when the app closes the pipe
+            if parse_command(line) == "refresh":
+                fetch_wake.set()
+
     threading.Thread(target=refresh, daemon=True).start()
+    threading.Thread(target=live_loop, args=(status, fetch_wake, data_wake.set), daemon=True).start()
+    threading.Thread(target=commands, daemon=True).start()
     last, busy_until = None, 0.0
     while True:
         st = state()
@@ -474,6 +532,9 @@ def stream():
             busy_until = time.time() + BUSY_LINGER
         elif st == "on" and time.time() < busy_until:
             st = "busy"
+        if status["busy"] and st != "busy":
+            status["turn_end"] = time.time()
+        status["busy"] = st == "busy"
         line = json.dumps({"state": st, **latest["data"]})
         if line != last:
             sys.stdout.write(line + "\n")
@@ -508,6 +569,18 @@ def selfcheck():
     assert parse_usage(usage, dt.datetime(2026, 12, 30))["seven_day"]["resets_at"] == dt.datetime(2027, 10, 29, 7).timestamp()
     assert parse_usage("Please log in", dt.datetime(2026, 10, 22)) is None
     assert next_backoff(60, None) == 120 and next_backoff(600, None) == MAX_BACKOFF
+    # fetch schedule
+    assert next_fetch(1000, False, 0, 0) == 1000 + FETCH_IDLE
+    assert next_fetch(1000, True, 0, 0) == 1000 + FETCH_BUSY
+    assert next_fetch(1000, False, 1100, 0) == 1105  # 5 s after the turn ended
+    assert next_fetch(1106, False, 1100, 0) == 1130  # then the late-accounting check
+    assert next_fetch(1131, False, 1100, 0) == 1131 + FETCH_IDLE
+    assert next_fetch(1000, False, 999, 0) == 1000 + MIN_GAP  # never sooner than MIN_GAP
+    assert next_fetch(1000, True, 0, 2000) == 2000  # backing off after a failure
+    assert should_fetch(1100, 1000, 1300, requested=True)  # menu opened: fetch now
+    assert not should_fetch(1010, 1000, 1300, requested=True)  # ...unless the last was 10 s ago
+    assert should_fetch(1300, 1000, 1300, requested=False) and not should_fetch(1299, 1000, 1300, False)
+    assert parse_command(" Refresh\n") == "refresh" and parse_command("rm -rf\n") is None
     assert next_backoff(60, 300) == 300
     assert iso_ts("2026-11-05T07:59:00Z") == iso_ts("2026-11-05T07:59:00.123456+00:00")
     reset = dt.datetime(2026, 10, 21, 22, 10)
@@ -597,6 +670,7 @@ if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         selfcheck()
     elif "--once" in sys.argv:
+        fetch_once()
         print(json.dumps({"state": state(), **data()}, indent=1))
     else:
         stream()
